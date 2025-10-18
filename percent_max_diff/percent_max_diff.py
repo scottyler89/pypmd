@@ -1,4 +1,5 @@
 import os
+import sys
 import ray
 import h5py
 import time
@@ -23,7 +24,17 @@ except:
 
 ##################################
 
-def cp(file1,file2 = None):
+def cp(file1, file2=None):
+    """Copy a file to a new path.
+
+    Parameters
+    ----------
+    file1 : str
+        Source file path. If a single string with a space is provided it
+        will be split into two paths for convenience.
+    file2 : str or None
+        Destination file path.
+    """
     if file2 is None:
         ## check if a single string was given in, separated by a space
         temp_f_list = file1.split(" ")
@@ -75,6 +86,18 @@ def pairwise_raw_pmd(in_mat):
 
 @njit(fastmath=True)
 def get_e(x):
+    """Expected counts under independence for a contingency table.
+
+    Parameters
+    ----------
+    x : ndarray of shape (n_rows, n_cols)
+        Non-negative integer counts.
+
+    Returns
+    -------
+    ndarray of shape (n_rows, n_cols)
+        Expected counts matrix E = (row_sums / total) * col_sums.
+    """
     row_sums = np.sum(x,axis=1)
     row_sums = row_sums/np.sum(row_sums)
     col_sums = np.sum(x,axis=0)
@@ -109,8 +132,22 @@ def one_hot(in_vect):
     return(out_mat)
 
 
-@njit(fastmath=True)#numba.cfunc(numba.int32[:,:],numba.uint32)
+@njit(fastmath=True)
 def get_null_vects(x, num_boot=1000):
+    """Bootstrap PMD null by shuffling row labels.
+
+    Parameters
+    ----------
+    x : ndarray
+        Count matrix.
+    num_boot : int, default=1000
+        Number of bootstrap permutations.
+
+    Returns
+    -------
+    ndarray of shape (num_boot,)
+        Bootstrap samples of PMD values.
+    """
     #x=np.array(x, x.dtype)#np.dtype(x.shape,))#,dtype=np.int32)
     all_counts = np.sum(x)
     row_vect = np.zeros((int(all_counts)), dtype=np.int32)
@@ -222,8 +259,21 @@ def get_detailed_null_vects(x, num_boot=1000):
 
 
 
-@njit(fastmath=True)#(forceobj=True)
+@njit(fastmath=True)
 def get_pmd(x):
+    """Compute unadjusted PMD for a count matrix.
+
+    Parameters
+    ----------
+    x : ndarray of shape (n_rows, n_cols)
+        Non-negative integer counts.
+
+    Returns
+    -------
+    float
+        PMD ratio in [0, 1] where 1 indicates maximally different columns
+        given the observed column marginals.
+    """
     col_sums = np.sum(x,axis=0)
     if np.sum(col_sums)==0:
         print("sum(col_sums)==0!")
@@ -248,6 +298,7 @@ def get_pmd(x):
 
 
 def get_detailed_pmd(x):
+    """Return unadjusted PMD and residuals (observed - expected)."""
     temp_pmd = np.array(get_pmd(x),dtype=np.float64)
     temp_resid = np.array(x-get_e(x),dtype=np.float64)
     return(temp_pmd, temp_resid)
@@ -259,13 +310,15 @@ def get_detailed_pmd(x):
 #get_null_vects(collate_vects(np.array([0,1,1,1,2,2,2]),np.array([0,1,1,1,2,2,1]),(3,3)))
 
 @njit(fastmath=True)
-def pmd_post_hoc_x(x, num_boot=1000, h5_out = None):
+def pmd_post_hoc_x(x, num_boot=1000, h5_out=None):
+    """Pairwise unadjusted PMD between columns (Numba kernel)."""
     ##################################
     out_pmd = np.zeros((x.shape[1],x.shape[1]))
     for i in prange(x.shape[1]):
         for j in range(x.shape[1]):
             if i!=j:
-                temp_res = np.float64(get_pmd(x[:,[i,j]], num_boot=num_boot))
+                # get_pmd does not use num_boot; compute directly
+                temp_res = np.float64(get_pmd(x[:,[i,j]]))
                 out_pmd[i,j] = temp_res
                 out_pmd[j,i] = temp_res
     return(out_pmd)
@@ -273,7 +326,20 @@ def pmd_post_hoc_x(x, num_boot=1000, h5_out = None):
 
 
 @jit(forceobj=True)
-def pmd_post_hoc(pmd_res=None, x=None, num_boot=1000, h5_out = None):
+def pmd_post_hoc(pmd_res=None, x=None, num_boot=1000, h5_out=None):
+    """Pairwise PMD between columns with optional HDF5 output.
+
+    Parameters
+    ----------
+    pmd_res : pmd or None
+        Existing result object; if provided, uses its `x`.
+    x : ndarray or None
+        Count matrix to compute pairwise PMD over.
+    num_boot : int
+        Number of bootstrap permutations used for debiasing.
+    h5_out : str or None
+        If provided, write results to this HDF5 path under dataset "infile".
+    """
     ## returns either the path that was provided by the user to the output h5_out file, or
     ## if that was None, then it returns the actual pairwise PMD matrix
     if x is None and pmd_res is not None:
@@ -281,7 +347,7 @@ def pmd_post_hoc(pmd_res=None, x=None, num_boot=1000, h5_out = None):
     num_col=x.shape[1]
     ##################################
     if h5_out is not None:
-        f=h5.File(h5_out,'a')
+        f=h5py.File(h5_out,'a')
         ## create the output dataset
         out_pmd = f.create_dataset("infile",
                                 (num_col,num_col),
@@ -292,11 +358,9 @@ def pmd_post_hoc(pmd_res=None, x=None, num_boot=1000, h5_out = None):
     for i in prange(num_col):
         for j in range(num_col):
             if i!=j:
-                try:
-                    temp_res = pmd(x[:,[i,j]], num_boot=num_boot)
-                except:
-                    out_pmd[i,j] = temp_res.pmd
-                    out_pmd[j,i] = temp_res.pmd
+                temp_res = pmd(x[:,[i,j]], num_boot=num_boot)
+                out_pmd[i,j] = temp_res.pmd
+                out_pmd[j,i] = temp_res.pmd
     if h5_out is not None:
         f.close()
         return(h5_out)
@@ -354,8 +418,8 @@ def collate_par_res(all_results, row_idxs, col_idxs):
     row_min = np.min(row_idxs)
     col_max = np.max(col_idxs)
     col_min = np.min(col_idxs)
-    row_range = numba.int32(row_max-row_min)
-    col_range = numba.int32(col_max-col_min)
+    row_range = nb.int32(row_max-row_min)
+    col_range = nb.int32(col_max-col_min)
     out_mat = np.zeros((row_range,col_range))
     for idx in prange(all_results.shape[0]):
         row_idx = row_idxs[idx]
@@ -367,7 +431,26 @@ def collate_par_res(all_results, row_idxs, col_idxs):
 
 
 @njit(fastmath=True)
-def get_pmd_pairs(a, b=None, num_boot = 1000):
+def get_pmd_pairs(a, b=None, num_boot=1000):
+    """Pairwise debiased PMD between columns.
+
+    If `b` is None, compute the symmetric pairwise PMD across columns of `a`.
+    Otherwise compute the rectangular matrix comparing columns of `a` against `b`.
+
+    Parameters
+    ----------
+    a : ndarray
+        Count matrix A.
+    b : ndarray or None
+        Optional count matrix B. If omitted, B = A.
+    num_boot : int
+        Number of bootstrap permutations for null debiasing.
+
+    Returns
+    -------
+    ndarray
+        Pairwise PMD matrix.
+    """
     ## goes through the columns of a, comparing them to column b
     # idxs in a are in rows, b will be in cols
     # if only a is supplied, it will give a symmetric a x a matrix
@@ -537,6 +620,23 @@ def pad_output(out_pmd_mini_mat,
 
 @jit(forceobj=True)
 def do_parallel_pmd_col_comparisons(in_mat, out_hdf5, block_size=5000, num_boot=8, threads=None, force=False):
+    """Compute large pairwise PMD matrix in HDF5 blocks using Ray.
+
+    Parameters
+    ----------
+    in_mat : str
+        Path to an input HDF5 file with dataset "infile" (counts).
+    out_hdf5 : str
+        Path to output HDF5 file to write dataset "infile" (pairwise PMD).
+    block_size : int
+        Column block size for processing.
+    num_boot : int
+        Bootstrap iterations for debiasing within blocks.
+    threads : int or None
+        Number of Ray workers; defaults to CPU count.
+    force : bool
+        If False and output exists, skip computation.
+    """
     #################################################
     if force==False and os.path.isfile(out_hdf5):
         print("\n"*10)
@@ -669,6 +769,19 @@ def do_parallel_pmd_col_comparisons(in_mat, out_hdf5, block_size=5000, num_boot=
 ####################################################################################################################
 ####################################################################################################################
 def get_euc(in_pmd_h5, out_euc_h5, block_size = 5000, force = False):
+    """Compute negative Euclidean distances over a PMD matrix in blocks.
+
+    Parameters
+    ----------
+    in_pmd_h5 : str
+        HDF5 file path containing pairwise PMD matrix under dataset "infile".
+    out_euc_h5 : str
+        Output HDF5 file path for negative Euclidean distances.
+    block_size : int
+        Block size for chunked computation.
+    force : bool
+        If False and output exists, reuse it.
+    """
     euclidean_distances = metrics.pairwise.euclidean_distances
     in_pmd_f = h5py.File(in_pmd_h5,'a')
     in_pmd = in_pmd_f["infile"]
@@ -983,9 +1096,41 @@ def get_compositional_resid(
 ####################################################################################################################
 
 class pmd(object):
-    def __init__(self, x, y=None, num_boot=1000, skip_posthoc = False):
-        ## if x is a 2d matrix
-        ## if x and y are count vectors
+    def __init__(self, x, y=None, num_boot=1000, skip_posthoc=False):
+        """Compute PMD and related statistics for a count matrix.
+
+        Parameters
+        ----------
+        x : numpy.ndarray or pandas.DataFrame
+            Non-negative integer counts with shape (n_features, n_samples).
+            If a DataFrame is provided, row/column labels are preserved.
+        y : unused
+            Reserved for future use.
+        num_boot : int, default 1000
+            Number of bootstrap permutations to estimate the null.
+        skip_posthoc : bool, default False
+            If True, skip pairwise post-hoc PMD between columns to save time.
+
+        Attributes
+        ----------
+        pmd : float
+            Debiased PMD in approximately [0, 1].
+        raw_pmd : float
+            Unadjusted PMD before null debiasing.
+        null : ndarray
+            Bootstrap samples of PMD under the null.
+        null_lambda : float
+            Mean of the null distribution.
+        p_val : float
+            One-sided p-value relative to the null.
+        residuals : pandas.DataFrame
+            Observed minus expected counts under independence.
+        z_scores, p_vals, corrected_p_vals : pandas.DataFrame
+            Cell-wise significance measures.
+        post_hoc : pandas.DataFrame
+            Pairwise PMD between columns (if computed).
+        """
+        # Basic validation and coercion
         if "index" in dir(x):
             rows = x.index
             cols = x.columns
@@ -993,6 +1138,12 @@ class pmd(object):
             rows = np.arange(x.shape[0],dtype=np.int32)
             cols = np.arange(x.shape[1],dtype=np.int32)
         self.x = np.array(x,dtype=np.int64)
+        if self.x.ndim != 2:
+            raise ValueError("x must be a 2D count matrix")
+        if np.any(self.x < 0):
+            raise ValueError("x must contain non-negative counts")
+        ## if x is a 2d matrix
+        ## if x and y are count vectors
         #self.raw_pmd = get_pmd(x)
         self.raw_pmd, self.residuals = get_detailed_pmd(self.x)
         #self.null = get_null_vects(x, num_boot=num_boot)
@@ -1019,7 +1170,7 @@ class pmd(object):
             self.z_scores, 
             self.residual_sd
         )
-        ## conver to pandas
+        ## convert to pandas
         self.z_scores = pd.DataFrame(self.z_scores, index = rows, columns = cols)
         self.p_vals = pd.DataFrame(self.p_vals, index = rows, columns = cols)
         self.corrected_p_vals = pd.DataFrame(self.corrected_p_vals, index = rows, columns = cols)
@@ -1048,4 +1199,3 @@ def do_demo():
 
 
 #r = do_demo()
-
