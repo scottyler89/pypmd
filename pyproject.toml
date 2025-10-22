@@ -41,3 +41,10 @@ where = ["."]
 include = ["percent_max_diff*", "pypmd*"]
 exclude = ["tests*", "docs*"]
 
+[project.optional-dependencies]
+benchmark = [
+  "tqdm>=4.65",
+  "seaborn>=0.12",
+  "scikit-bio>=0.6.0; python_version<'3.13'",  # optional; skip if incompatible
+  "polars>=0.20; platform_system!='Windows'",   # optional
+]

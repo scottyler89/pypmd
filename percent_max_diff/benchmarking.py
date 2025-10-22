@@ -18,7 +18,7 @@ support and parallel runners per the plan in docs/benchmarking.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple, Sequence, Union
 
 import numpy as np
 import pandas as pd
@@ -64,6 +64,36 @@ class SimulationConfig:
             "inv_simpson", "entropy",
             "jsd", "tv", "hellinger", "braycurtis", "canberra", "cosine"
         ]
+    composition : str
+        One of {"uniform", "dirichlet"}. If "dirichlet", use `dirichlet_alpha`.
+    dirichlet_alpha : Union[float, Sequence[float], None]
+        Concentration(s) for Dirichlet base composition when `composition=="dirichlet"`.
+    effect : str
+        One of {"overlap_shift", "fold_change"}.
+    effect_indices : Optional[Sequence[int]]
+        Feature indices affected for fold-change effect (0-based). If None, picks one.
+    effect_fold : float
+        Fold-change applied to affected features in the second column when
+        `effect=="fold_change"`.
+    sampling_model : str
+        One of {"multinomial", "poisson_multinomial", "poisson_independent"}.
+        - multinomial: fixed depths N1, N2.
+        - poisson_multinomial: draw depths D1~Pois(N1), D2~Pois(N2), then multinomial.
+        - poisson_independent: draw counts independently Pois(Nj * p_j).
+    null_model : str
+        One of {"permutation", "parametric"} for debiasing.
+    store_null_draws : bool
+        If True, collect and return null PMD draws per run.
+    executor : str
+        One of {"sequential", "multiprocessing", "ray"}. Only sequential and
+        multiprocessing are implemented in this MVP.
+    show_progress : bool
+        If True and `tqdm` is installed, display a progress bar during grids.
+    expand_union : bool
+        If True (and effect == 'overlap_shift'), simulate a non-wrapping label
+        shift so the union of clusters is K + s (as in the R script), by
+        padding the composition for column 2 into new indices. When False,
+        use cyclic shift with union size K.
     """
 
     K: int
@@ -81,6 +111,7 @@ class SimulationConfig:
             "chi2",
             "chi2_p",
             "cramers_v",
+            "cramers_v_bc",
             "inv_simpson",
             "entropy",
             "jsd",
@@ -91,6 +122,21 @@ class SimulationConfig:
             "cosine",
         ]
     )
+    composition: str = "uniform"
+    dirichlet_alpha: Union[float, Sequence[float], None] = None
+    effect: str = "overlap_shift"
+    effect_indices: Optional[Sequence[int]] = None
+    effect_fold: float = 2.0
+    sampling_model: str = "multinomial"
+    null_model: str = "permutation"
+    store_null_draws: bool = False
+    executor: str = "sequential"
+    show_progress: bool = False
+    expand_union: bool = False
+    warn_eps: float = 1e-9
+    entropy_method: str = "hypergeo"  # "hypergeo" | "bootstrap"
+    lambda_mode: str = "bootstrap"  # "bootstrap" | "approx"
+    lambda_model_path: Optional[str] = None
 
 
 # -----------------------------
@@ -110,6 +156,20 @@ def uniform_probs(K: int) -> np.ndarray:
     if K <= 0:
         raise ValueError("K must be positive")
     return np.full(K, 1.0 / K, dtype=float)
+
+
+def dirichlet_probs(K: int, alpha: Union[float, Sequence[float]], rng: np.random.Generator) -> np.ndarray:
+    """Dirichlet composition over K features.
+
+    alpha can be a scalar or a length-K vector.
+    """
+    if np.isscalar(alpha):
+        a = np.full(K, float(alpha), dtype=float)
+    else:
+        a = np.asarray(alpha, dtype=float)
+        if a.shape[0] != K:
+            raise ValueError("dirichlet_alpha length must equal K")
+    return rng.dirichlet(a)
 
 
 def apply_overlap_shift(p: np.ndarray, s: int, *, K: Optional[int] = None) -> np.ndarray:
@@ -135,6 +195,34 @@ def apply_overlap_shift(p: np.ndarray, s: int, *, K: Optional[int] = None) -> np
     return np.roll(p, s)
 
 
+def apply_fold_change(
+    p: np.ndarray,
+    indices: Sequence[int],
+    fold: float,
+) -> np.ndarray:
+    """Apply a multiplicative fold-change to selected indices and renormalize.
+
+    Parameters
+    ----------
+    p : ndarray
+        Base composition vector.
+    indices : sequence of int
+        Indices to scale.
+    fold : float
+        Multiplicative factor (>0). Values >1 enrich, <1 deplete.
+    """
+    if fold <= 0:
+        raise ValueError("fold must be > 0")
+    out = p.astype(float).copy()
+    out = np.maximum(out, 0.0)
+    idx = np.asarray(indices, dtype=int)
+    out[idx] *= float(fold)
+    total = out.sum()
+    if total <= 0:
+        raise ValueError("fold-change produced zero-sum composition")
+    return out / total
+
+
 # -----------------------------
 # Sampling models
 # -----------------------------
@@ -150,6 +238,26 @@ def sample_counts_multinomial(N: int, p: np.ndarray, rng: np.random.Generator) -
     return rng.multinomial(int(N), p).astype(np.int64)
 
 
+def _sample_counts_for_column(
+    N_or_mu: int,
+    p: np.ndarray,
+    rng: np.random.Generator,
+    *,
+    model: str,
+) -> np.ndarray:
+    """Sample a single column according to the chosen sampling model."""
+    if model == "multinomial":
+        return sample_counts_multinomial(int(N_or_mu), p, rng)
+    elif model == "poisson_multinomial":
+        depth = int(rng.poisson(max(0.0, float(N_or_mu))))
+        return sample_counts_multinomial(depth, p, rng)
+    elif model == "poisson_independent":
+        mu_vec = float(N_or_mu) * p
+        return rng.poisson(mu_vec).astype(np.int64)
+    else:
+        raise ValueError(f"unknown sampling model: {model}")
+
+
 def simulate_two_column_counts(
     K: int,
     N1: int,
@@ -158,19 +266,60 @@ def simulate_two_column_counts(
     rng: np.random.Generator,
     *,
     base_probs: Optional[np.ndarray] = None,
+    composition: str = "uniform",
+    dirichlet_alpha: Union[float, Sequence[float], None] = None,
+    effect: str = "overlap_shift",
+    effect_indices: Optional[Sequence[int]] = None,
+    effect_fold: float = 2.0,
+    sampling_model: str = "multinomial",
+    expand_union: bool = False,
 ) -> np.ndarray:
     """Simulate a K×2 count matrix with `s` non-shared clusters (overlap shift).
 
     Uses uniform base composition unless `base_probs` is provided.
     """
 
-    p1 = uniform_probs(K) if base_probs is None else np.asarray(base_probs, dtype=float)
+    # Base composition
+    if base_probs is not None:
+        p1 = np.asarray(base_probs, dtype=float)
+    else:
+        if composition == "uniform":
+            p1 = uniform_probs(K)
+        elif composition == "dirichlet":
+            if dirichlet_alpha is None:
+                dirichlet_alpha = 1.0
+            p1 = dirichlet_probs(K, dirichlet_alpha, rng)
+        else:
+            raise ValueError("unknown composition model")
     if p1.shape[0] != K:
         raise ValueError("base_probs length must equal K")
-    p2 = apply_overlap_shift(p1, s, K=K)
-    x1 = sample_counts_multinomial(N1, p1, rng)
-    x2 = sample_counts_multinomial(N2, p2, rng)
-    return np.stack([x1, x2], axis=1)  # shape (K, 2)
+    # Effect on column 2
+    if effect == "overlap_shift":
+        if expand_union and s > 0:
+            newK = int(K + s)
+            p1_pad = np.zeros(newK, dtype=float)
+            p2_pad = np.zeros(newK, dtype=float)
+            p1_pad[0:K] = p1
+            # Non-wrapping shift: place p1 starting at index s for column 2
+            p2_pad[s : s + K] = p1
+            p1_use, p2_use = p1_pad, p2_pad
+        else:
+            p2 = apply_overlap_shift(p1, s, K=K)
+            p1_use, p2_use = p1, p2
+    elif effect == "fold_change":
+        idx = (
+            [int(i) for i in effect_indices]
+            if effect_indices is not None and len(effect_indices) > 0
+            else [int(s % K)]  # pick one index based on s for reproducibility
+        )
+        p2 = apply_fold_change(p1, idx, effect_fold)
+        p1_use, p2_use = p1, p2
+    else:
+        raise ValueError("unknown effect model")
+
+    x1 = _sample_counts_for_column(N1, p1_use, rng, model=sampling_model)
+    x2 = _sample_counts_for_column(N2, p2_use, rng, model=sampling_model)
+    return np.stack([x1, x2], axis=1)
 
 
 # -----------------------------
@@ -209,36 +358,76 @@ def _normalize_counts_to_probs(
     return (x / total), True
 
 
+def _downsample_column_hypergeo(col_counts: np.ndarray, d: int, rng: np.random.Generator) -> np.ndarray:
+    """Downsample a single column to depth d without replacement (multivariate hypergeometric)."""
+    counts = col_counts.astype(int).copy()
+    out = np.zeros_like(counts)
+    total = int(counts.sum())
+    d_rem = int(d)
+    if total <= 0 or d_rem <= 0:
+        return out
+    K = counts.shape[0]
+    for i in range(K - 1):
+        ngood = int(counts[i])
+        nbad = int(total - ngood)
+        if d_rem <= 0 or (ngood + nbad) <= 0:
+            xi = 0
+        else:
+            xi = int(rng.hypergeometric(ngood, nbad, d_rem))
+        out[i] = xi
+        d_rem -= xi
+        total -= ngood
+    out[-1] = max(0, d_rem)
+    return out
+
+
 def shannon_entropy_across_columns(
-    X: np.ndarray, *, downsample: bool = True, rng: Optional[np.random.Generator] = None
+    X: np.ndarray,
+    *,
+    downsample: bool = True,
+    downsample_method: str = "hypergeo",
+    rng: Optional[np.random.Generator] = None,
 ) -> float:
     """Mean per-row Shannon entropy of the 2-vector across columns.
 
-    If `downsample=True`, columns are downsampled without replacement to the
-    minimum depth before computing per-row entropy, to avoid depth bias.
+    If `downsample=True`, columns are downsampled to equal depth before entropy.
+    Methods:
+      - "hypergeo": without replacement (multivariate hypergeometric), mirrors R.
+      - "bootstrap": with replacement quick approximation.
+    Special case: if K == 1, duplicate the single row to avoid undefined entropy.
     """
 
     X = np.asarray(X, dtype=np.int64)
     if X.ndim != 2 or X.shape[1] != 2:
         raise ValueError("X must be shape (K, 2)")
     K = X.shape[0]
+    if K == 1:
+        X = np.vstack([X, X])
+        K = 2
     if downsample:
         if rng is None:
             rng = np.random.default_rng()
         d = int(min(X[:, 0].sum(), X[:, 1].sum()))
         if d == 0:
             return float("nan")
-        # Draw d categorical samples per column according to column probabilities
-        def draw_col(col_counts: np.ndarray) -> np.ndarray:
-            p, ok = _normalize_counts_to_probs(col_counts, mode="none")
-            if not ok:
-                return np.zeros_like(col_counts)
-            idx = rng.choice(np.arange(K), size=d, replace=True, p=p)
-            out = np.zeros(K, dtype=int)
-            np.add.at(out, idx, 1)
-            return out
+        if downsample_method == "hypergeo":
+            col0 = _downsample_column_hypergeo(X[:, 0], d, rng)
+            col1 = _downsample_column_hypergeo(X[:, 1], d, rng)
+        elif downsample_method == "bootstrap":
+            def draw_boot(col_counts: np.ndarray) -> np.ndarray:
+                p, ok = _normalize_counts_to_probs(col_counts, mode="none")
+                if not ok:
+                    return np.zeros_like(col_counts)
+                idx = rng.choice(np.arange(K), size=d, replace=True, p=p)
+                out = np.zeros(K, dtype=int)
+                np.add.at(out, idx, 1)
+                return out
 
-        Xds = np.stack([draw_col(X[:, 0]), draw_col(X[:, 1])], axis=1)
+            col0 = draw_boot(X[:, 0])
+            col1 = draw_boot(X[:, 1])
+        else:
+            raise ValueError("downsample_method must be 'hypergeo' or 'bootstrap'")
+        Xds = np.stack([col0, col1], axis=1)
     else:
         Xds = X
 
@@ -251,7 +440,6 @@ def shannon_entropy_across_columns(
             entropies.append(np.nan)
             continue
         p = v / s
-        # entropy base 2 to align with JSD docs
         entropies.append(stats.entropy(p, base=2))
     return float(np.nanmean(entropies))
 
@@ -261,14 +449,26 @@ def shannon_entropy_across_columns(
 # -----------------------------
 
 
-def chi2_and_cramers_v(X: np.ndarray) -> Tuple[float, float, float]:
-    """Compute chi-square test of independence and Cramer's V for (K, 2) table."""
+def cramers_v_stat(X: np.ndarray, *, bias_correction: bool = False) -> Tuple[float, float, float]:
+    """Chi-square, p-value, and (optionally bias-corrected) Cramer's V.
 
+    Bias correction follows Bergsma (2013) and matches rcompanion::cramerV(bias.correct=TRUE).
+    """
     chi2, pval, dof, expected = stats.chi2_contingency(X, correction=False)
     N = X.sum()
-    # For 2 columns, min(K-1, B-1) = 1
-    v = np.sqrt(chi2 / (N * 1.0)) if N > 0 else np.nan
-    return chi2, pval, v
+    if N <= 0:
+        return float("nan"), float("nan"), float("nan")
+    r, k = X.shape
+    phi2 = chi2 / N
+    if not bias_correction:
+        v = np.sqrt(phi2 / max(1e-12, min(k - 1, r - 1)))
+    else:
+        phi2corr = max(0.0, phi2 - ((k - 1) * (r - 1)) / max(1.0, N - 1))
+        rcorr = r - ((r - 1) ** 2) / max(1.0, N - 1)
+        kcorr = k - ((k - 1) ** 2) / max(1.0, N - 1)
+        denom = max(1e-12, min(kcorr - 1.0, rcorr - 1.0))
+        v = np.sqrt(phi2corr / denom)
+    return float(chi2), float(pval), float(v)
 
 
 def inverse_simpson_per_column(X: np.ndarray) -> float:
@@ -343,7 +543,59 @@ def cosine_distance(X: np.ndarray, mode: str = "none") -> float:
     return float(ssd.cosine(p1, p2))
 
 
-def compute_pmd_metrics(X: np.ndarray, *, num_boot: int) -> Tuple[float, float, float]:
+def _compute_null_pmd_parametric(X: np.ndarray, *, num_boot: int, rng: np.random.Generator) -> np.ndarray:
+    """Generate null PMD by simulating from independence with fixed column totals."""
+    R = X.sum(axis=1).astype(float)
+    N = float(R.sum())
+    if N <= 0:
+        return np.full(num_boot, np.nan, dtype=float)
+    p_row = R / N
+    C = X.sum(axis=0).astype(int)
+    out = np.zeros(num_boot, dtype=float)
+    for b in range(num_boot):
+        col1 = rng.multinomial(int(C[0]), p_row)
+        col2 = rng.multinomial(int(C[1]), p_row)
+        out[b] = float(_get_pmd_raw(np.stack([col1, col2], axis=1)))
+    return out
+
+
+_LAMBDA_MODEL_CACHE: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+
+
+def _approx_lambda_from_model(min_E: float, model_path: str) -> Optional[float]:
+    try:
+        import pandas as _pd
+    except Exception:
+        return None
+    if model_path in _LAMBDA_MODEL_CACHE:
+        xs, ys = _LAMBDA_MODEL_CACHE[model_path]
+    else:
+        if not os.path.exists(model_path):
+            return None
+        dfm = _pd.read_csv(model_path)
+        if "log2_minE" not in dfm.columns or "lambda_smooth" not in dfm.columns:
+            return None
+        xs = dfm["log2_minE"].to_numpy(dtype=float)
+        ys = dfm["lambda_smooth"].to_numpy(dtype=float)
+        _LAMBDA_MODEL_CACHE[model_path] = (xs, ys)
+    if min_E <= 0:
+        return float(np.nan)
+    x = np.log2(min_E)
+    # clamp to bounds
+    x = float(np.clip(x, xs.min(), xs.max()))
+    lam = float(np.interp(x, xs, ys))
+    return lam
+
+
+def compute_pmd_metrics(
+    X: np.ndarray,
+    *,
+    num_boot: int,
+    null_model: str = "permutation",
+    rng: Optional[np.random.Generator] = None,
+    lambda_mode: str = "bootstrap",
+    lambda_model_path: Optional[str] = None,
+) -> Tuple[float, float, float, Optional[np.ndarray]]:
     """Compute raw PMD, debiased PMD using empirical λ, and λ.
 
     Returns
@@ -353,11 +605,28 @@ def compute_pmd_metrics(X: np.ndarray, *, num_boot: int) -> Tuple[float, float, 
     lam : float
     """
 
+    if rng is None:
+        rng = np.random.default_rng()
     raw = float(_get_pmd_raw(X))
-    null_draws, _ = _get_null_vects(X, num_boot=num_boot)
-    lam = float(np.mean(null_draws))
-    debiased = (raw - lam) / (1.0 - lam) if lam != 1.0 else np.nan
-    return raw, debiased, lam
+    null_draws: Optional[np.ndarray]
+    if lambda_mode == "approx" and lambda_model_path:
+        # approximate lambda from model
+        R = X.sum(axis=1, keepdims=True).astype(float)
+        C = X.sum(axis=0, keepdims=True).astype(float)
+        tot = float(X.sum())
+        min_E = float(((R * C) / tot).min()) if tot > 0 else float("nan")
+        lam = _approx_lambda_from_model(min_E, lambda_model_path)
+        null_draws = None
+    else:
+        if null_model == "permutation":
+            null_draws, _ = _get_null_vects(X, num_boot=num_boot)
+        elif null_model == "parametric":
+            null_draws = _compute_null_pmd_parametric(X, num_boot=num_boot, rng=rng)
+        else:
+            raise ValueError("unknown null_model")
+        lam = float(np.nanmean(null_draws))
+    debiased = (raw - lam) / (1.0 - lam) if (lam is not None and lam != 1.0) else np.nan
+    return raw, debiased, lam, null_draws
 
 
 # -----------------------------
@@ -375,7 +644,20 @@ def run_single_simulation(
     pseudocount_mode: str = "none",
     rng: Optional[np.random.Generator] = None,
     metrics: Optional[List[str]] = None,
-) -> Dict[str, float]:
+    composition: str = "uniform",
+    dirichlet_alpha: Union[float, Sequence[float], None] = None,
+    effect: str = "overlap_shift",
+    effect_indices: Optional[Sequence[int]] = None,
+    effect_fold: float = 2.0,
+    sampling_model: str = "multinomial",
+    null_model: str = "permutation",
+    store_null_draws: bool = False,
+    expand_union: bool = False,
+    warn_eps: float = 1e-9,
+    entropy_method: str = "hypergeo",
+    lambda_mode: str = "bootstrap",
+    lambda_model_path: Optional[str] = None,
+) -> Dict[str, Union[float, np.ndarray]]:
     """Simulate one table and compute selected metrics.
 
     Returns a flat dict suitable for DataFrame construction.
@@ -384,13 +666,42 @@ def run_single_simulation(
     if rng is None:
         rng = np.random.default_rng()
 
-    X = simulate_two_column_counts(K, N1, N2, s, rng)
+    X = simulate_two_column_counts(
+        K,
+        N1,
+        N2,
+        s,
+        rng,
+        composition=composition,
+        dirichlet_alpha=dirichlet_alpha,
+        effect=effect,
+        effect_indices=effect_indices,
+        effect_fold=effect_fold,
+        sampling_model=sampling_model,
+        expand_union=expand_union,
+    )
+    # expected table and small expected count warnings
+    if X.sum() > 0:
+        R = X.sum(axis=1)[:, None].astype(float)
+        C = X.sum(axis=0)[None, :].astype(float)
+        E = (R * C) / float(X.sum())
+        tiny_E_count = int((E < warn_eps).sum())
+        tiny_E_frac = float(tiny_E_count) / float(E.size)
+    else:
+        tiny_E_count = 0
+        tiny_E_frac = float("nan")
+
     out: Dict[str, float] = {
         "K": float(K),
         "N1": float(N1),
         "N2": float(N2),
         "s": float(s),
         "min_E": float((X.sum(axis=1)[:, None] * X.sum(axis=0)[None, :] / X.sum()).min()) if X.sum() > 0 else np.nan,
+        "total_clusters": float(X.shape[0]),
+        "observed_clusters": float(int((X.sum(axis=1) > 0).sum())),
+        "tiny_E_count": float(tiny_E_count),
+        "tiny_E_frac": float(tiny_E_frac),
+        "warn_eps": float(warn_eps),
     }
 
     metrics = metrics or [
@@ -411,28 +722,42 @@ def run_single_simulation(
 
     # PMD family
     if ("pmd_raw" in metrics) or ("pmd" in metrics):
-        raw, debiased, lam = compute_pmd_metrics(X, num_boot=num_boot)
+        raw, debiased, lam, null_draws = compute_pmd_metrics(
+            X,
+            num_boot=num_boot,
+            null_model=null_model,
+            rng=rng,
+            lambda_mode=lambda_mode,
+            lambda_model_path=lambda_model_path,
+        )
         if "pmd_raw" in metrics:
             out["pmd_raw"] = raw
             out["pmd_lambda"] = lam
         if "pmd" in metrics:
             out["pmd"] = debiased
+        if store_null_draws:
+            out["pmd_null_draws"] = null_draws
 
     # Classical stats
-    if ("chi2" in metrics) or ("cramers_v" in metrics) or ("chi2_p" in metrics):
-        chi2, pval, v = chi2_and_cramers_v(X)
+    if ("chi2" in metrics) or ("cramers_v" in metrics) or ("chi2_p" in metrics) or ("cramers_v_bc" in metrics):
+        chi2, pval, v = cramers_v_stat(X, bias_correction=False)
         if "chi2" in metrics:
             out["chi2"] = chi2
         if "chi2_p" in metrics:
             out["chi2_p"] = pval
         if "cramers_v" in metrics:
             out["cramers_v"] = v
+        if "cramers_v_bc" in metrics:
+            _, _, vbc = cramers_v_stat(X, bias_correction=True)
+            out["cramers_v_bc"] = vbc
 
     # Diversity/entropy
     if "inv_simpson" in metrics:
         out["inv_simpson"] = inverse_simpson_per_column(X)
     if "entropy" in metrics:
-        out["entropy"] = shannon_entropy_across_columns(X, downsample=True, rng=rng)
+        out["entropy"] = shannon_entropy_across_columns(
+            X, downsample=True, downsample_method=entropy_method, rng=rng
+        )
 
     # Distances (probability-based unless noted)
     if "jsd" in metrics:
@@ -451,28 +776,140 @@ def run_single_simulation(
     return out
 
 
-def run_simulation_grid(cfg: SimulationConfig) -> pd.DataFrame:
-    """Run a small grid over s_values × iters and return a tidy DataFrame."""
+def _worker_single(args: Tuple[SimulationConfig, int, int, int]) -> Dict[str, Union[float, np.ndarray]]:
+    cfg, s, rep, seed = args
+    rep_rng = np.random.default_rng(int(seed))
+    row = run_single_simulation(
+        cfg.K,
+        cfg.N1,
+        cfg.N2,
+        int(s),
+        num_boot=cfg.num_boot,
+        pseudocount_mode=cfg.pseudocount_mode,
+        rng=rep_rng,
+        metrics=cfg.compute_metrics,
+        composition=cfg.composition,
+        dirichlet_alpha=cfg.dirichlet_alpha,
+        effect=cfg.effect,
+        effect_indices=cfg.effect_indices,
+        effect_fold=cfg.effect_fold,
+        sampling_model=cfg.sampling_model,
+        null_model=cfg.null_model,
+        store_null_draws=cfg.store_null_draws,
+        expand_union=cfg.expand_union,
+        warn_eps=cfg.warn_eps,
+        entropy_method=cfg.entropy_method,
+        lambda_mode=cfg.lambda_mode,
+        lambda_model_path=cfg.lambda_model_path,
+    )
+    row["iter"] = float(rep)
+    row["seed"] = float(seed)
+    return row
+
+
+def run_simulation_grid(cfg: SimulationConfig) -> Union[pd.DataFrame, Tuple[pd.DataFrame, pd.DataFrame]]:
+    """Run a grid over s_values × iters and return results.
+
+    Returns a DataFrame of results. If `cfg.store_null_draws` is True, also
+    returns a second DataFrame with null draws linked by (K,N1,N2,s,iter).
+    """
+
+    import time as _time
 
     rng = np.random.default_rng(cfg.random_state)
-    rows: List[Dict[str, float]] = []
+    rows: List[Dict[str, Union[float, np.ndarray]]] = []
+    null_rows: List[Dict[str, float]] = []
+
+    work_items: List[Tuple[SimulationConfig, int, int, int]] = []
     for s in cfg.s_values:
         for rep in range(cfg.iters):
-            seed = rng.integers(0, 2**63 - 1, dtype=np.uint64)
-            rep_rng = np.random.default_rng(int(seed))
-            row = run_single_simulation(
-                cfg.K,
-                cfg.N1,
-                cfg.N2,
-                int(s),
-                num_boot=cfg.num_boot,
-                pseudocount_mode=cfg.pseudocount_mode,
-                rng=rep_rng,
-                metrics=cfg.compute_metrics,
-            )
-            row["iter"] = float(rep)
+            seed = int(rng.integers(0, 2**63 - 1, dtype=np.uint64))
+            work_items.append((cfg, int(s), int(rep), seed))
+
+    t0 = _time.perf_counter()
+    total_items = len(work_items)
+    pbar = None
+    if cfg.show_progress:
+        try:
+            from tqdm.auto import tqdm as _tqdm
+            pbar = _tqdm(total=total_items, desc="PMD sims")
+        except Exception:
+            pbar = None
+
+    if cfg.executor == "multiprocessing":
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        with ProcessPoolExecutor() as ex:
+            futures = [ex.submit(_worker_single, wi) for wi in work_items]
+            for fut in futures:
+                row = fut.result()
+                rows.append(row)
+                if pbar is not None:
+                    pbar.update(1)
+    elif cfg.executor == "ray":
+        try:
+            import ray  # type: ignore
+
+            if not ray.is_initialized():
+                ray.init(ignore_reinit_error=True, include_dashboard=False, logging_level=40)
+
+            @ray.remote
+            def _ray_worker(args: Tuple[SimulationConfig, int, int, int]):
+                return _worker_single(args)
+
+            futures = [_ray_worker.remote(wi) for wi in work_items]
+            while futures:
+                done, futures = ray.wait(futures, num_returns=1)
+                row = ray.get(done[0])
+                rows.append(row)
+                if pbar is not None:
+                    pbar.update(1)
+        except Exception as e:
+            # Fallback to sequential if Ray unavailable
+            for wi in work_items:
+                row = _worker_single(wi)
+                rows.append(row)
+                if pbar is not None:
+                    pbar.update(1)
+    elif cfg.executor in ("sequential", None):
+        for wi in work_items:
+            row = _worker_single(wi)
             rows.append(row)
-    return pd.DataFrame.from_records(rows)
+            if pbar is not None:
+                pbar.update(1)
+    else:
+        raise ValueError("unsupported executor; choose 'sequential' or 'multiprocessing'")
+
+    elapsed_total = _time.perf_counter() - t0
+    if pbar is not None:
+        pbar.close()
+
+    results_df = pd.DataFrame.from_records(rows)
+    # Extract null draws if present
+    if cfg.store_null_draws and ("pmd_null_draws" in results_df.columns):
+        for idx, nd in results_df["pmd_null_draws"].items():
+            if isinstance(nd, np.ndarray):
+                r = results_df.loc[idx]
+                for b, val in enumerate(nd):
+                    null_rows.append(
+                        {
+                            "K": float(cfg.K),
+                            "N1": float(cfg.N1),
+                            "N2": float(cfg.N2),
+                            "s": float(r["s"]),
+                            "iter": float(r["iter"]),
+                            "boot": float(b),
+                            "pmd_null": float(val),
+                        }
+                    )
+        results_df = results_df.drop(columns=["pmd_null_draws"])
+
+    results_df["elapsed_total_sec"] = float(elapsed_total)
+    if cfg.store_null_draws:
+        null_df = pd.DataFrame.from_records(null_rows)
+        return results_df, null_df
+    else:
+        return results_df
 
 
 __all__ = [
@@ -482,5 +919,53 @@ __all__ = [
     "simulate_two_column_counts",
     "run_single_simulation",
     "run_simulation_grid",
+    "pairwise_js_distance",
 ]
 
+
+def pairwise_js_distance(P: np.ndarray, base: float = 2.0) -> np.ndarray:
+    """Compute pairwise Jensen–Shannon distance for probability columns.
+
+    Parameters
+    ----------
+    P : ndarray (K, B)
+        Columns are distributions (non-negative, sum to 1). No smoothing is applied.
+    base : float
+        Log base used for divergence; 2.0 bounds distances to [0,1].
+
+    Returns
+    -------
+    D : ndarray (B, B)
+        Symmetric matrix of JSD distances.
+    """
+    P = np.asarray(P, dtype=float)
+    if P.ndim != 2:
+        raise ValueError("P must be 2D with shape (K, B)")
+    # Ensure columns sum to 1 (best-effort); if a column sums to 0, distance is NaN
+    col_sums = P.sum(axis=0)
+    valid = col_sums > 0
+    P = P[:, valid] / col_sums[valid]
+    B = P.shape[1]
+    if B == 0:
+        return np.full((0, 0), np.nan)
+    # Broadcast to (K, B, B)
+    P_i = P[:, :, None]
+    P_j = P[:, None, :]
+    M = 0.5 * (P_i + P_j)
+    # Compute KL(P_i || M) safely: only where P_i > 0 and M > 0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        term_i = np.where(P_i > 0, P_i * (np.log(P_i) - np.log(M)), 0.0)
+        term_j = np.where(P_j > 0, P_j * (np.log(P_j) - np.log(M)), 0.0)
+    KL_i = term_i.sum(axis=0)
+    KL_j = term_j.sum(axis=0)
+    JSD = 0.5 * (KL_i + KL_j)
+    if base and base != np.e:
+        JSD = JSD / np.log(base)
+    D = np.sqrt(np.maximum(JSD, 0.0))
+    # Expand back to original columns if some were invalid
+    out = np.full((col_sums.shape[0], col_sums.shape[0]), np.nan, dtype=float)
+    idx = np.where(valid)[0]
+    for a, ia in enumerate(idx):
+        for b, ib in enumerate(idx):
+            out[ia, ib] = D[a, b]
+    return out
