@@ -34,7 +34,7 @@ def main() -> None:
     ch = os.path.join(base, "characterize")
     if os.path.isdir(ch):
         parts.append(section("Characterize"))
-        for name in ["results.csv","null.csv","results_r.csv","null_r.csv","characterize_pmd.png","characterize_comparators.png","characterize_pmd.pdf","characterize_super_grid.png","characterize_merged.png","lambda_model.csv"]:
+        for name in ["results.csv","null.csv","results_r.csv","null_r.csv","characterize_pmd.png","characterize_comparators.png","characterize_pmd.pdf","characterize_super_grid.png","characterize_merged.png"]:
             fp = os.path.join(ch, name)
             if os.path.exists(fp):
                 parts.append(f"- {name}: {os.path.relpath(fp, base)}\n")
@@ -64,4 +64,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

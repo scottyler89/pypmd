@@ -13,8 +13,18 @@ from __future__ import annotations
 
 import argparse
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
-from typing import List
+from typing import List, Optional, Tuple
+
+from benchmarks.config import (
+    DEFAULT_DATASET_PAIR_SET,
+    dataset_pair_sets,
+    default_dataset_pairs_str,
+    default_invariance,
+    parallel_env,
+    resolve_max_workers,
+)
 
 import numpy as np
 from scipy import stats
@@ -69,8 +79,8 @@ def simulate_invariance_counts(
         p2 = np.concatenate([[1.0 - pcnt_diff], np.full(K, pcnt_diff / max(1, K))])
         # Build union counts: rows = 1 + K
         x1 = np.zeros(1 + K, dtype=int)
-        x1[0] = N1
-        x2 = np.random.multinomial(int(N2), p2).astype(int)
+        x1[0] = int(N1)
+        x2 = rng.multinomial(int(N2), p2).astype(int)
         X = np.stack([x1, x2], axis=1)
         return X
     elif mode == "symmetric":
@@ -82,8 +92,8 @@ def simulate_invariance_counts(
         p2_pad = np.zeros(newK, dtype=float)
         p1_pad[0:K] = base
         p2_pad[shift : shift + K] = base
-        x1 = np.random.multinomial(int(N1), p1_pad).astype(int)
-        x2 = np.random.multinomial(int(N2), p2_pad).astype(int)
+        x1 = rng.multinomial(int(N1), p1_pad).astype(int)
+        x2 = rng.multinomial(int(N2), p2_pad).astype(int)
         X = np.stack([x1, x2], axis=1)
         return X
     elif mode == "fixed_union_private":
@@ -93,21 +103,82 @@ def simulate_invariance_counts(
         p2[0] = max(0.0, 1.0 - pcnt_diff)
         if K > 1:
             p2[1:] = pcnt_diff / (K - 1)
-        x1 = np.random.multinomial(int(N1), p1).astype(int)
-        x2 = np.random.multinomial(int(N2), p2).astype(int)
+        x1 = rng.multinomial(int(N1), p1).astype(int)
+        x2 = rng.multinomial(int(N2), p2).astype(int)
         X = np.stack([x1, x2], axis=1)
         return X
     else:
         raise ValueError("unknown invariance mode")
 
 
+def _invariance_worker(args: Tuple[int, int, int, int, float, int, str, int, str, int]) -> Tuple[int, dict]:
+    (
+        idx,
+        N1,
+        N2,
+        K,
+        pcnt,
+        it,
+        mode,
+        num_boot,
+        entropy_method,
+        seed,
+    ) = args
+    rng = np.random.default_rng(seed)
+    ds_label = f"{N1}_vs_{N2}"
+    X = simulate_invariance_counts(K, pcnt, mode, N1, N2, rng)
+    raw, pmd, _, _ = compute_pmd_metrics(X, num_boot=num_boot, null_model="permutation", rng=rng)
+    mask = (X.sum(axis=1) > 0)
+    X_chi = X[mask, :]
+    if X_chi.shape[0] >= 2:
+        chi2, pval, v = cramers_v_stat(X_chi, bias_correction=False)
+        _, _, vbc = cramers_v_stat(X_chi, bias_correction=True)
+    else:
+        chi2, pval, v, vbc = (float("nan"), float("nan"), float("nan"), float("nan"))
+    inv_simp = inverse_simpson_per_column(X)
+    ent = shannon_entropy_across_columns(X, downsample=True, downsample_method=entropy_method, rng=rng)
+
+    row = {
+        "dataset_sizes": ds_label,
+        "iter": it,
+        "NumberOfClusters": K,
+        "K": K,
+        "percent_different_clusters_numeric": pcnt,
+        "mode": mode,
+        "raw_pmd": raw,
+        "pmd": pmd,
+        "chi_sq": chi2,
+        "chi_neg_log_p": (lambda _v: (np.finfo(float).max if not np.isfinite(_v) else _v))(
+            (-stats.chi2.logsf(chi2, max(int(X_chi.shape[0]) - 1, 1)) / np.log(10.0)) if np.isfinite(chi2) else float("nan")
+        ),
+        "cramers_v": v,
+        "cramers_v_bc": vbc,
+        "inverse_simp": inv_simp,
+        "shannon_entropy": ent,
+        "jsd": js_distance(X),
+        "tv": total_variation(X),
+        "hellinger": hellinger_dist(X),
+        "braycurtis": bray_curtis(X),
+        "canberra": canberra_dist(X),
+        "cosine": cosine_distance(X),
+        "b1_size": N1,
+        "b2_size": N2,
+        "total_number_of_clusters": int((X.sum(axis=1) > 0).sum()),
+    }
+    return idx, row
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--num-clust-range", type=str, default="4,8,12,16")
-    ap.add_argument("--percent-difference", type=str, default="0,0.25,0.5,0.75,1.0")
-    # Default dataset sizes to match original R script
-    ap.add_argument("--b1-sizes", type=str, default="10000,10000,1000,250,250,100")
-    ap.add_argument("--b2-sizes", type=str, default="10000,1000,1000,2000,250,100")
+    inv = default_invariance()
+    ap.add_argument("--num-clust-range", type=str, default=inv["k_list_str"]) 
+    ap.add_argument("--percent-difference", type=str, default=inv["pdiffs_str"]) 
+    # Default dataset sizes from SSoT
+    default_set = DEFAULT_DATASET_PAIR_SET
+    ap.add_argument("--dataset-pair-set", choices=dataset_pair_sets(), default=default_set,
+                    help=f"choose dataset pair regime (default: {default_set})")
+    ap.add_argument("--b1-sizes", type=str, default=None)
+    ap.add_argument("--b2-sizes", type=str, default=None)
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--expand-b2-only", type=str, default="false")
     ap.add_argument("--mode", choices=["expand_b2_only","symmetric","fixed_union_private"], default="symmetric")
@@ -116,12 +187,24 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--tag", type=str, default="invariance")
     ap.add_argument("--r-compat", type=str, default="false")
     ap.add_argument("--entropy-method", choices=["hypergeo","bootstrap"], default="hypergeo")
+    ap.add_argument("--max-workers", type=int, default=None, help="number of worker processes (default: sequential)")
+    ap.add_argument("--executor", choices=["sequential", "multiprocessing", "ray"], default=None, help=argparse.SUPPRESS)
     ap.add_argument("--outdir", type=str, default="", help="optional explicit output directory")
     return ap.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    n1_default, n2_default = default_dataset_pairs_str(args.dataset_pair_set)
+    if args.b1_sizes is None:
+        args.b1_sizes = n1_default
+    if args.b2_sizes is None:
+        args.b2_sizes = n2_default
+    max_workers = resolve_max_workers(args.max_workers)
+    if args.executor:
+        import warnings
+        warnings.warn("--executor is deprecated; use --max-workers instead", DeprecationWarning)
+    os.environ.update(parallel_env())
     rng = np.random.default_rng(args.seed)
     K_list = parse_list_int(args.num_clust_range)
     pdiffs = parse_list_float(args.percent_difference)
@@ -138,55 +221,33 @@ def main() -> None:
         out_dir = os.path.join("benchmarks", "out", f"{ts}_{args.tag}")
         os.makedirs(out_dir, exist_ok=True)
 
-    rows = []
+    work_items: List[Tuple[int, int, int, int, float, int, str, int, str, int]] = []
     for N1, N2 in zip(N1s, N2s):
-        ds_label = f"{N1}_vs_{N2}"
         for K in K_list:
             for pcnt in pdiffs:
                 for it in range(args.iters):
-                    X = simulate_invariance_counts(K, pcnt, mode, N1, N2, rng)
-                    raw, pmd, lam, _ = compute_pmd_metrics(X, num_boot=args.num_boot, null_model="permutation", rng=rng)
-                    # For chi-square & Cramer's V, drop all-zero rows to avoid expected zero errors
-                    mask = (X.sum(axis=1) > 0)
-                    X_chi = X[mask, :]
-                    if X_chi.shape[0] >= 2:
-                        chi2, pval, v = cramers_v_stat(X_chi, bias_correction=False)
-                        _, _, vbc = cramers_v_stat(X_chi, bias_correction=True)
-                    else:
-                        chi2, pval, v, vbc = (float('nan'), float('nan'), float('nan'), float('nan'))
-                    inv_simp = inverse_simpson_per_column(X)
-                    ent = shannon_entropy_across_columns(X, downsample=True, downsample_method=args.entropy_method, rng=rng)
+                    seed = int(rng.integers(0, 2**63 - 1, dtype=np.uint64))
+                    work_items.append((len(work_items), N1, N2, K, float(pcnt), int(it), mode, args.num_boot, args.entropy_method, seed))
 
-                    rows.append({
-                        "dataset_sizes": ds_label,
-                        "iter": it,
-                        "NumberOfClusters": K,
-                        "percent_different_clusters_numeric": pcnt,
-                        "mode": mode,
-                        "raw_pmd": raw,
-                        "pmd": pmd,
-                        "chi_sq": chi2,
-                        # Robust -log10(p) via log survival; dof = (r-1)(c-1) with c=2
-                        "chi_neg_log_p": (
-                            (-stats.chi2.logsf(chi2, max(int(X_chi.shape[0]) - 1, 1)) / np.log(10.0)) if np.isfinite(chi2) else float('nan')
-                        ),
-                        "cramers_v": v,
-                        "cramers_v_bc": vbc,
-                        "inverse_simp": inv_simp,
-                        "shannon_entropy": ent,
-                        # Comparator distances (probability-based)
-                        "jsd": js_distance(X),
-                        "tv": total_variation(X),
-                        "hellinger": hellinger_dist(X),
-                        "braycurtis": bray_curtis(X),
-                        "canberra": canberra_dist(X),
-                        "cosine": cosine_distance(X),
-                        "b1_size": N1,
-                        "b2_size": N2,
-                        "total_number_of_clusters": int((X.sum(axis=1) > 0).sum()),
-                    })
+    rows: List[dict] = []
+    if max_workers > 1 and len(work_items) > 1:
+        ordered: List[Optional[dict]] = [None] * len(work_items)
+        with ProcessPoolExecutor(max_workers=max_workers) as ex:
+            future_map = {ex.submit(_invariance_worker, wi): wi[0] for wi in work_items}
+            for fut in as_completed(future_map):
+                idx, row = fut.result()
+                ordered[idx] = row
+        rows = [row for row in ordered if row is not None]
+    else:
+        for wi in work_items:
+            _, row = _invariance_worker(wi)
+            rows.append(row)
 
     df = pd.DataFrame.from_records(rows)
+    df["dataset_pair_set"] = args.dataset_pair_set
+    df["n_workers"] = max_workers
+    df["num_boot"] = args.num_boot
+    df["entropy_method"] = args.entropy_method
     out_csv = os.path.join(out_dir, "invariance_results.csv")
     df.to_csv(out_csv, index=False)
     print(f"wrote {out_csv}")
@@ -262,6 +323,16 @@ def main() -> None:
             "--full-grid", "true",
         ]
         subprocess.run(plot_cmd, check=True)
+        # Run validator (baseline rule-set) on this mode
+        try:
+            subprocess.run([
+                sys.executable,
+                os.path.join("benchmarks", "validate_invariance_linear.py"),
+                "--file", out_csv,
+                "--out-dir", out_dir,
+            ], check=True)
+        except Exception:
+            print("warning: invariance validator failed; continuing")
     except Exception:
         print("warning: failed to render invariance super grid; results CSV is available")
 

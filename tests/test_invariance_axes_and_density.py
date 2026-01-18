@@ -3,14 +3,19 @@ import sys
 from pathlib import Path
 import pandas as pd
 
+from benchmarks.config import default_dataset_pairs
+
 
 def _write_invariance(tmp: Path):
     # minimal invariance results: two K values, several percents, include NaN for Cramer's V at 0
+    ds_pairs = default_dataset_pairs()
+    first_pair = ds_pairs[0]
+    ds_label = f"{first_pair[0]}_vs_{first_pair[1]}"
     rows = []
     for K in [4, 8]:
         for p in [0.0, 0.5, 1.0]:
             rows.append({
-                "dataset_sizes": "250_vs_500",
+                "dataset_sizes": ds_label,
                 "iter": 0,
                 "NumberOfClusters": K,
                 "percent_different_clusters_numeric": p,
@@ -22,8 +27,8 @@ def _write_invariance(tmp: Path):
                 "cramers_v_bc": (None if p==0.0 else 0.1 + 0.8*p),
                 "inverse_simp": 1.0 + p,
                 "shannon_entropy": p,
-                "b1_size": 250,
-                "b2_size": 500,
+                "b1_size": first_pair[0],
+                "b2_size": first_pair[1],
                 "total_number_of_clusters": K,
             })
     df = pd.DataFrame(rows)
@@ -62,4 +67,3 @@ def test_plot_characterize_null_density(tmp_path):
     m.main()
     assert (tmp_path/"characterize_pmd.png").exists()
     assert (tmp_path/"null_pmd_density.png").exists()
-

@@ -144,10 +144,7 @@ Goal: include the standalone figures that the original R script emitted in addit
 - [x] Optional Ray executor for large grids; graceful shutdown/fallback.
 - [x] Controls for `num_boot` vs. runtime; warn on tiny `E_{ij}`.  
       Added `warn_eps` handling and outputs (`tiny_E_count`, `tiny_E_frac`) in results rows; CLI `--warn-eps`.
-- [x] Optional λ approximation as a function of `min(E)` to reduce bootstraps (fit after collecting data; cache table). Implemented `benchmarks/fit_lambda_model.py` to export `lambda_model.csv`.
-  - [x] JSD computation: vectorized helper `pairwise_js_distance` for (K,B) probabilities; O(B²K) via broadcasting.
- - [x] Optional parametric λ model (beyond mean Poisson MLE), e.g., smoothed mapping cached and reused in runners.  
-      Implemented `--lambda-mode approx` with `--lambda-model` CSV; cached interpolation in runners.
+- [x] JSD computation: vectorized helper `pairwise_js_distance` for (K,B) probabilities; O(B²K) via broadcasting.
 
 ## Phase 6 — Reporting
 

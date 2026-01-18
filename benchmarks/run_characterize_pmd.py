@@ -5,7 +5,7 @@ Usage (defaults are small and quick):
   python benchmarks/run_characterize_pmd.py --K 10 --N1 2000 --N2 2000 \
       --smax 10 --iters 5 --num-boot 200 --pseudocount none \
       --composition uniform --effect overlap_shift --sampling multinomial \
-      --null permutation --executor sequential --store-null false --tag quick --progress true
+      --null permutation --max-workers 1 --store-null false --tag quick --progress true
 
 Outputs are written to benchmarks/out/YYYYMMDD_HHMMSS_tag/{results.csv,null.csv,config.json}.
 """
@@ -20,6 +20,13 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 
+from benchmarks.config import (
+    CHAR_SMAX,
+    CHAR_ITERS,
+    CHAR_NUM_BOOT,
+    parallel_env,
+    resolve_max_workers,
+)
 from percent_max_diff.benchmarking import SimulationConfig, run_simulation_grid
 
 
@@ -29,9 +36,9 @@ def parse_args() -> argparse.Namespace:
     # Match R's characterize_pmd() defaults
     ap.add_argument("--N1", type=int, default=1000)
     ap.add_argument("--N2", type=int, default=1000)
-    ap.add_argument("--smax", type=int, default=10, help="max s (inclusive) for overlap shift sweep")
-    ap.add_argument("--iters", type=int, default=5)
-    ap.add_argument("--num-boot", type=int, default=200)
+    ap.add_argument("--smax", type=int, default=CHAR_SMAX, help="max s (inclusive) for overlap shift sweep")
+    ap.add_argument("--iters", type=int, default=CHAR_ITERS)
+    ap.add_argument("--num-boot", type=int, default=CHAR_NUM_BOOT)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--pseudocount", choices=["none", "one"], default="none")
     ap.add_argument("--composition", choices=["uniform", "dirichlet"], default="uniform")
@@ -41,7 +48,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--effect-fold", type=float, default=3.0)
     ap.add_argument("--sampling", choices=["multinomial", "poisson_multinomial", "poisson_independent"], default="multinomial")
     ap.add_argument("--null", choices=["permutation", "parametric"], default="permutation")
-    ap.add_argument("--executor", choices=["sequential", "multiprocessing"], default="sequential")
+    ap.add_argument("--max-workers", type=int, default=None, help="number of worker processes (default: sequential)")
+    ap.add_argument("--executor", choices=["sequential", "multiprocessing"], default=None, help=argparse.SUPPRESS)
     ap.add_argument("--store-null", type=str, default="false", help="true/false")
     ap.add_argument("--tag", type=str, default="quick")
     ap.add_argument("--outdir", type=str, default="", help="optional explicit output directory")
@@ -52,8 +60,6 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--r-compat", type=str, default="false", help="true/false: also write R-compatible CSVs (results_r.csv, null_r.csv)")
     ap.add_argument("--r-num-sim", type=int, default=100, help="num null draws per iter for R-compatible null_r.csv (s==0)")
     ap.add_argument("--entropy-method", choices=["hypergeo","bootstrap"], default="hypergeo")
-    ap.add_argument("--lambda-mode", choices=["bootstrap","approx"], default="bootstrap")
-    ap.add_argument("--lambda-model", type=str, default="", help="path to lambda_model.csv for --lambda-mode approx")
     return ap.parse_args()
 
 
@@ -66,6 +72,12 @@ def main() -> None:
         if args.effect_indices
         else None
     )
+
+    max_workers = resolve_max_workers(args.max_workers)
+    if args.executor:
+        import warnings
+        warnings.warn("--executor is deprecated; use --max-workers instead", DeprecationWarning)
+    dataset_label = f"{args.N1}_vs_{args.N2}"
 
     cfg = SimulationConfig(
         K=args.K,
@@ -84,13 +96,11 @@ def main() -> None:
         sampling_model=args.sampling,
         null_model=args.null,
         store_null_draws=store_null,
-        executor=args.executor,
+        n_workers=max_workers,
         show_progress=(str(args.progress).lower() in {"1", "true", "yes"}),
         expand_union=(str(args.expand_union).lower() in {"1", "true", "yes"}),
         warn_eps=float(args.warn_eps),
         entropy_method=args.entropy_method,
-        lambda_mode=args.lambda_mode,
-        lambda_model_path=(args.lambda_model or None),
     )
 
     if args.outdir:
@@ -101,17 +111,22 @@ def main() -> None:
         out_dir = os.path.join("benchmarks", "out", f"{ts}_{args.tag}")
         os.makedirs(out_dir, exist_ok=True)
 
+    os.environ.update(parallel_env())
     res = run_simulation_grid(cfg)
     if isinstance(res, tuple):
         results_df, null_df = res
     else:
         results_df, null_df = res, None
 
+    results_df = results_df.copy()
+    results_df["dataset_sizes"] = dataset_label
     results_path = os.path.join(out_dir, "results.csv")
     results_df.to_csv(results_path, index=False)
     print(f"wrote {results_path}")
 
     if null_df is not None:
+        null_df = null_df.copy()
+        null_df["dataset_sizes"] = dataset_label
         null_path = os.path.join(out_dir, "null.csv")
         null_df.to_csv(null_path, index=False)
         print(f"wrote {null_path}")
@@ -135,7 +150,8 @@ def main() -> None:
             "sampling_model": cfg.sampling_model,
             "null_model": cfg.null_model,
             "store_null_draws": cfg.store_null_draws,
-            "executor": cfg.executor,
+            "n_workers": cfg.n_workers,
+            "dataset_sizes": dataset_label,
         }, fh, indent=2)
     print(f"wrote {cfg_path}")
 
@@ -147,18 +163,24 @@ def main() -> None:
         if "chi_sq" not in df_r.columns and "chi2" in results_df.columns:
             df_r["chi_sq"] = results_df["chi2"].values
         if ("chi_sq" in df_r.columns) and ("chi_neg_log_p" not in df_r.columns):
-            # Prefer robust log-survival when we can infer dof
+            # Prefer robust log-survival when we can infer dof; clamp inf to float max
             rows_obs = results_df.get("observed_clusters", results_df.get("total_clusters", np.nan))
             if rows_obs is not None and rows_obs.notna().any():
                 try:
                     from scipy import stats as _sps
                     dof = np.maximum(rows_obs.astype(float) - 1.0, 1.0)
-                    df_r["chi_neg_log_p"] = -_sps.chi2.logsf(df_r["chi_sq"].to_numpy(dtype=float), dof.to_numpy(dtype=float)) / np.log(10.0)
+                    vals = -_sps.chi2.logsf(df_r["chi_sq"].to_numpy(dtype=float), dof.to_numpy(dtype=float)) / np.log(10.0)
+                    vals[~np.isfinite(vals)] = np.finfo(float).max
+                    df_r["chi_neg_log_p"] = vals
                 except Exception:
                     if "chi2_p" in results_df.columns:
-                        df_r["chi_neg_log_p"] = -np.log10(results_df["chi2_p"])  # no clipping
+                        vals = -np.log10(results_df["chi2_p"].to_numpy(dtype=float))
+                        vals[~np.isfinite(vals)] = np.finfo(float).max
+                        df_r["chi_neg_log_p"] = vals
             elif "chi2_p" in results_df.columns:
-                df_r["chi_neg_log_p"] = -np.log10(results_df["chi2_p"])  # no clipping
+                vals = -np.log10(results_df["chi2_p"].to_numpy(dtype=float))
+                vals[~np.isfinite(vals)] = np.finfo(float).max
+                df_r["chi_neg_log_p"] = vals
         df_r["dataset_sizes"] = ds_label
         df_r["iter"] = df_r.get("iter", 0)
         df_r["total_cells"] = args.N1 + args.N2

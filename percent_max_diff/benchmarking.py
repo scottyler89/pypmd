@@ -17,6 +17,8 @@ support and parallel runners per the plan in docs/benchmarking.
 
 from __future__ import annotations
 
+import os
+import warnings
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple, Sequence, Union
 
@@ -84,9 +86,11 @@ class SimulationConfig:
         One of {"permutation", "parametric"} for debiasing.
     store_null_draws : bool
         If True, collect and return null PMD draws per run.
+    n_workers : int
+        Number of worker processes for parallel simulation. 1 runs sequentially.
     executor : str
-        One of {"sequential", "multiprocessing", "ray"}. Only sequential and
-        multiprocessing are implemented in this MVP.
+        Deprecated. One of {"sequential", "multiprocessing", "ray"} for backward
+        compatibility. Use `n_workers` instead.
     show_progress : bool
         If True and `tqdm` is installed, display a progress bar during grids.
     expand_union : bool
@@ -130,13 +134,12 @@ class SimulationConfig:
     sampling_model: str = "multinomial"
     null_model: str = "permutation"
     store_null_draws: bool = False
+    n_workers: int = 1
     executor: str = "sequential"
     show_progress: bool = False
     expand_union: bool = False
     warn_eps: float = 1e-9
     entropy_method: str = "hypergeo"  # "hypergeo" | "bootstrap"
-    lambda_mode: str = "bootstrap"  # "bootstrap" | "approx"
-    lambda_model_path: Optional[str] = None
 
 
 # -----------------------------
@@ -452,13 +455,26 @@ def shannon_entropy_across_columns(
 def cramers_v_stat(X: np.ndarray, *, bias_correction: bool = False) -> Tuple[float, float, float]:
     """Chi-square, p-value, and (optionally bias-corrected) Cramer's V.
 
+    Handles degenerate rows/columns by removing any with zero totals before
+    calling chi2_contingency. Returns NaNs if the table is < 2x2 after filtering.
+
     Bias correction follows Bergsma (2013) and matches rcompanion::cramerV(bias.correct=TRUE).
     """
-    chi2, pval, dof, expected = stats.chi2_contingency(X, correction=False)
-    N = X.sum()
+    X = np.asarray(X, dtype=float)
+    # Drop all-zero rows/cols to avoid zero expected counts
+    row_mask = X.sum(axis=1) > 0
+    col_mask = X.sum(axis=0) > 0
+    Xf = X[row_mask][:, col_mask]
+    if Xf.size == 0 or Xf.shape[0] < 2 or Xf.shape[1] < 2:
+        return float("nan"), float("nan"), float("nan")
+    try:
+        chi2, pval, dof, expected = stats.chi2_contingency(Xf, correction=False)
+    except Exception:
+        return float("nan"), float("nan"), float("nan")
+    N = Xf.sum()
     if N <= 0:
         return float("nan"), float("nan"), float("nan")
-    r, k = X.shape
+    r, k = Xf.shape
     phi2 = chi2 / N
     if not bias_correction:
         v = np.sqrt(phi2 / max(1e-12, min(k - 1, r - 1)))
@@ -559,42 +575,12 @@ def _compute_null_pmd_parametric(X: np.ndarray, *, num_boot: int, rng: np.random
     return out
 
 
-_LAMBDA_MODEL_CACHE: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
-
-
-def _approx_lambda_from_model(min_E: float, model_path: str) -> Optional[float]:
-    try:
-        import pandas as _pd
-    except Exception:
-        return None
-    if model_path in _LAMBDA_MODEL_CACHE:
-        xs, ys = _LAMBDA_MODEL_CACHE[model_path]
-    else:
-        if not os.path.exists(model_path):
-            return None
-        dfm = _pd.read_csv(model_path)
-        if "log2_minE" not in dfm.columns or "lambda_smooth" not in dfm.columns:
-            return None
-        xs = dfm["log2_minE"].to_numpy(dtype=float)
-        ys = dfm["lambda_smooth"].to_numpy(dtype=float)
-        _LAMBDA_MODEL_CACHE[model_path] = (xs, ys)
-    if min_E <= 0:
-        return float(np.nan)
-    x = np.log2(min_E)
-    # clamp to bounds
-    x = float(np.clip(x, xs.min(), xs.max()))
-    lam = float(np.interp(x, xs, ys))
-    return lam
-
-
 def compute_pmd_metrics(
     X: np.ndarray,
     *,
     num_boot: int,
     null_model: str = "permutation",
     rng: Optional[np.random.Generator] = None,
-    lambda_mode: str = "bootstrap",
-    lambda_model_path: Optional[str] = None,
 ) -> Tuple[float, float, float, Optional[np.ndarray]]:
     """Compute raw PMD, debiased PMD using empirical λ, and λ.
 
@@ -609,22 +595,16 @@ def compute_pmd_metrics(
         rng = np.random.default_rng()
     raw = float(_get_pmd_raw(X))
     null_draws: Optional[np.ndarray]
-    if lambda_mode == "approx" and lambda_model_path:
-        # approximate lambda from model
-        R = X.sum(axis=1, keepdims=True).astype(float)
-        C = X.sum(axis=0, keepdims=True).astype(float)
-        tot = float(X.sum())
-        min_E = float(((R * C) / tot).min()) if tot > 0 else float("nan")
-        lam = _approx_lambda_from_model(min_E, lambda_model_path)
-        null_draws = None
+    if null_model == "permutation":
+        seed_val = int(rng.integers(0, 2**31 - 1)) if rng is not None else None
+        if seed_val is not None:
+            np.random.seed(seed_val)
+        null_draws, _ = _get_null_vects(X, num_boot=num_boot)
+    elif null_model == "parametric":
+        null_draws = _compute_null_pmd_parametric(X, num_boot=num_boot, rng=rng)
     else:
-        if null_model == "permutation":
-            null_draws, _ = _get_null_vects(X, num_boot=num_boot)
-        elif null_model == "parametric":
-            null_draws = _compute_null_pmd_parametric(X, num_boot=num_boot, rng=rng)
-        else:
-            raise ValueError("unknown null_model")
-        lam = float(np.nanmean(null_draws))
+        raise ValueError("unknown null_model")
+    lam = float(np.nanmean(null_draws))
     debiased = (raw - lam) / (1.0 - lam) if (lam is not None and lam != 1.0) else np.nan
     return raw, debiased, lam, null_draws
 
@@ -655,8 +635,6 @@ def run_single_simulation(
     expand_union: bool = False,
     warn_eps: float = 1e-9,
     entropy_method: str = "hypergeo",
-    lambda_mode: str = "bootstrap",
-    lambda_model_path: Optional[str] = None,
 ) -> Dict[str, Union[float, np.ndarray]]:
     """Simulate one table and compute selected metrics.
 
@@ -727,8 +705,6 @@ def run_single_simulation(
             num_boot=num_boot,
             null_model=null_model,
             rng=rng,
-            lambda_mode=lambda_mode,
-            lambda_model_path=lambda_model_path,
         )
         if "pmd_raw" in metrics:
             out["pmd_raw"] = raw
@@ -799,8 +775,6 @@ def _worker_single(args: Tuple[SimulationConfig, int, int, int]) -> Dict[str, Un
         expand_union=cfg.expand_union,
         warn_eps=cfg.warn_eps,
         entropy_method=cfg.entropy_method,
-        lambda_mode=cfg.lambda_mode,
-        lambda_model_path=cfg.lambda_model_path,
     )
     row["iter"] = float(rep)
     row["seed"] = float(seed)
@@ -836,49 +810,50 @@ def run_simulation_grid(cfg: SimulationConfig) -> Union[pd.DataFrame, Tuple[pd.D
         except Exception:
             pbar = None
 
-    if cfg.executor == "multiprocessing":
+    # Determine worker policy (new n_workers with backward compatibility)
+    n_workers = getattr(cfg, "n_workers", 1) or 1
+    executor = getattr(cfg, "executor", "sequential") or "sequential"
+    use_ray = False
+    if executor != "sequential":
+        warnings.warn(
+            "SimulationConfig.executor is deprecated; use n_workers instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if executor == "multiprocessing" and n_workers <= 1:
+            # legacy behavior: default to all CPUs
+            cpu_total = os.cpu_count() or 1
+            n_workers = max(1, cpu_total)
+        elif executor == "ray":
+            warnings.warn(
+                "Ray execution is deprecated and will fall back to sequential processing.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            use_ray = False
+            n_workers = 1
+        elif executor not in ("sequential", "multiprocessing", "ray"):
+            raise ValueError(f"unsupported executor '{executor}'")
+
+    if n_workers > 1:
         from concurrent.futures import ProcessPoolExecutor, as_completed
 
-        with ProcessPoolExecutor() as ex:
-            futures = [ex.submit(_worker_single, wi) for wi in work_items]
-            for fut in futures:
+        ordered_rows: List[Optional[Dict[str, Union[float, np.ndarray]]]] = [None] * len(work_items)
+        with ProcessPoolExecutor(max_workers=n_workers) as ex:
+            future_to_idx = {ex.submit(_worker_single, wi): idx for idx, wi in enumerate(work_items)}
+            for fut in as_completed(future_to_idx):
+                idx = future_to_idx[fut]
                 row = fut.result()
-                rows.append(row)
+                ordered_rows[idx] = row
                 if pbar is not None:
                     pbar.update(1)
-    elif cfg.executor == "ray":
-        try:
-            import ray  # type: ignore
-
-            if not ray.is_initialized():
-                ray.init(ignore_reinit_error=True, include_dashboard=False, logging_level=40)
-
-            @ray.remote
-            def _ray_worker(args: Tuple[SimulationConfig, int, int, int]):
-                return _worker_single(args)
-
-            futures = [_ray_worker.remote(wi) for wi in work_items]
-            while futures:
-                done, futures = ray.wait(futures, num_returns=1)
-                row = ray.get(done[0])
-                rows.append(row)
-                if pbar is not None:
-                    pbar.update(1)
-        except Exception as e:
-            # Fallback to sequential if Ray unavailable
-            for wi in work_items:
-                row = _worker_single(wi)
-                rows.append(row)
-                if pbar is not None:
-                    pbar.update(1)
-    elif cfg.executor in ("sequential", None):
+        rows.extend(row for row in ordered_rows if row is not None)
+    else:
         for wi in work_items:
             row = _worker_single(wi)
             rows.append(row)
             if pbar is not None:
                 pbar.update(1)
-    else:
-        raise ValueError("unsupported executor; choose 'sequential' or 'multiprocessing'")
 
     elapsed_total = _time.perf_counter() - t0
     if pbar is not None:

@@ -78,8 +78,8 @@ def main() -> None:
                 "raw_pmd": raw,
                 "pmd": pmdd,
                 "chi_sq": chi2,
-                # Robust -log10(p) via log survival; dof = (r-1)(c-1) with c=2
-                "chi_neg_log_p": (-stats.chi2.logsf(chi2, max(int(X.shape[0]) - 1, 1)) / np.log(10.0)),
+                # Robust -log10(p) via log survival; dof = (r-1)(c-1) with c=2 (clamp inf to float max)
+                "chi_neg_log_p": (lambda v: (np.finfo(float).max if not np.isfinite(v) else v))(-stats.chi2.logsf(chi2, max(int(X.shape[0]) - 1, 1)) / np.log(10.0)),
                 "cramers_v": v,
                 "cramers_v_bc": vbc,
                 "inverse_simp": invs,

@@ -95,6 +95,16 @@ Notes
 - For quick exploration use `num_boot=200–500`; for publication‑grade, increase as needed.
 - Import either alias: `from percent_max_diff import pmd` or `from pypmd import pmd`.
 
+### Benchmarking defaults & runner
+
+Benchmark configuration and orchestration now follow a single source of truth. Inspect the canonical defaults any time with:
+
+```
+python -m benchmarks.config --print
+```
+
+To execute the end-to-end benchmark suite (characterize, overlays, invariance) use `benchmarks/run_all_benchmarks.py`. Control concurrency with a single flag: `--max-workers <N>` (0/1 or unset keeps it sequential; >1 enables a shared process pool with BLAS guards). Choose between the high-signal and low-signal regimes with `--dataset-pair-set {signal,low_signal,all}`; explicit `--N1-list/--b1-sizes` overrides remain honoured. The pipeline deterministically reseeds every scenario, so identical arguments yield identical outputs regardless of worker count. Full details live in `docs/benchmarking/ssot_parallel_runner.md`, including the unified CSV schema and directory layout under `benchmarks/out/`.
+
 ### Example: Differential abundance via GLM on z‑scores
 
 You can test for differential abundance of features across groups using the cell‑wise standardized residuals (`pmd_res.z_scores`). Below we simulate 10 features across 6 samples (3 untreated, 3 treated) where one feature is enriched in the treated group, then fit a simple GLM with Gaussian family per feature.

@@ -93,10 +93,14 @@ def main() -> None:
         rows = df["observed_clusters"].fillna(df.get("total_clusters", np.nan)) if "observed_clusters" in df.columns else df["total_clusters"]
         dof = np.maximum(rows.astype(float) - 1.0, 1.0)
         with np.errstate(divide="ignore", invalid="ignore"):
-            df["neglog10_p"] = -sps.chi2.logsf(df["chi2"].to_numpy(dtype=float), dof.to_numpy(dtype=float)) / np.log(10.0)
+            vals = -sps.chi2.logsf(df["chi2"].to_numpy(dtype=float), dof.to_numpy(dtype=float)) / np.log(10.0)
+            vals[~np.isfinite(vals)] = np.finfo(float).max
+            df["neglog10_p"] = vals
     elif "chi2_p" in df.columns:
         # Fallback: direct transform (no clipping)
-        df["neglog10_p"] = -np.log10(df["chi2_p"])
+        vals = -np.log10(df["chi2_p"].to_numpy(dtype=float))
+        vals[~np.isfinite(vals)] = np.finfo(float).max
+        df["neglog10_p"] = vals
     if "min_E" in df.columns:
         df["log2_minE"] = np.log2(df["min_E"].replace(0, np.nan))
     if "pmd_lambda" not in df.columns and "pmd" in df.columns and "pmd_raw" in df.columns:

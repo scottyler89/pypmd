@@ -16,6 +16,14 @@ import shutil
 from datetime import datetime
 from typing import List
 
+from benchmarks.config import (
+    DEFAULT_DATASET_PAIR_SET,
+    dataset_pair_sets,
+    default_dataset_pairs_str,
+    parallel_env,
+    resolve_max_workers,
+)
+
 import pandas as pd
 import numpy as np
 
@@ -29,9 +37,12 @@ def parse_list(s: str) -> List[int]:
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--K", type=int, default=10)
-    # Defaults match R's do_full_pmd_characterization pairs
-    ap.add_argument("--N1-list", type=str, default="10000,10000,1000,250,250,100", help="comma-separated list, e.g., 10000,10000,1000,250,250,100")
-    ap.add_argument("--N2-list", type=str, default="10000,1000,1000,2000,250,100", help="comma-separated list, e.g., 10000,1000,1000,2000,250,100")
+    # Defaults match canonical SSoT dataset pairs
+    default_set = DEFAULT_DATASET_PAIR_SET
+    ap.add_argument("--dataset-pair-set", choices=dataset_pair_sets(), default=default_set,
+                    help=f"choose dataset pair regime (default: {default_set})")
+    ap.add_argument("--N1-list", type=str, default=None, help="comma-separated list (default: set-dependent)")
+    ap.add_argument("--N2-list", type=str, default=None, help="comma-separated list (default: set-dependent)")
     ap.add_argument("--smax", type=int, default=10)
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--num-boot", type=int, default=200)
@@ -42,7 +53,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--effect", choices=["overlap_shift", "fold_change"], default="overlap_shift")
     ap.add_argument("--sampling", choices=["multinomial", "poisson_multinomial", "poisson_independent"], default="multinomial")
     ap.add_argument("--null", choices=["permutation", "parametric"], default="permutation")
-    ap.add_argument("--executor", choices=["sequential", "multiprocessing", "ray"], default="sequential")
+    ap.add_argument("--max-workers", type=int, default=None, help="number of worker processes (default: sequential)")
+    ap.add_argument("--executor", choices=["sequential", "multiprocessing", "ray"], default=None, help=argparse.SUPPRESS)
     ap.add_argument("--store-null", type=str, default="true")
     ap.add_argument("--expand-union", type=str, default="true")
     ap.add_argument("--progress", type=str, default="true")
@@ -52,13 +64,16 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--r-compat", type=str, default="false")
     ap.add_argument("--r-num-sim", type=int, default=100)
     ap.add_argument("--entropy-method", choices=["hypergeo","bootstrap"], default="hypergeo")
-    ap.add_argument("--lambda-mode", choices=["bootstrap","approx"], default="bootstrap")
-    ap.add_argument("--lambda-model", type=str, default="")
     return ap.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    n1_default, n2_default = default_dataset_pairs_str(args.dataset_pair_set)
+    if args.N1_list is None:
+        args.N1_list = n1_default
+    if args.N2_list is None:
+        args.N2_list = n2_default
     N1s = parse_list(args.N1_list)
     N2s = parse_list(args.N2_list)
     s_values = list(range(0, max(0, args.smax) + 1))
@@ -73,6 +88,13 @@ def main() -> None:
 
     results_rows = []
     null_rows = []
+
+    max_workers = resolve_max_workers(args.max_workers)
+    if args.executor:
+        import warnings
+        warnings.warn("--executor is deprecated; use --max-workers instead", DeprecationWarning)
+
+    os.environ.update(parallel_env())
 
     for N1, N2 in zip(N1s, N2s):
         cfg = SimulationConfig(
@@ -90,13 +112,11 @@ def main() -> None:
             sampling_model=args.sampling,
             null_model=args.null,
             store_null_draws=True,
-            executor=args.executor,
+            n_workers=max_workers,
             show_progress=(str(args.progress).lower() in {"1", "true", "yes"}),
             expand_union=(str(args.expand_union).lower() in {"1", "true", "yes"}),
             warn_eps=float(args.warn_eps),
             entropy_method=args.entropy_method,
-            lambda_mode=args.lambda_mode,
-            lambda_model_path=(args.lambda_model or None),
         )
         res = run_simulation_grid(cfg)
         if isinstance(res, tuple):
@@ -105,10 +125,14 @@ def main() -> None:
             df, nd = res, None
         df = df.copy()
         df["dataset_sizes"] = f"{N1}_vs_{N2}"
+        df["dataset_pair_set"] = args.dataset_pair_set
+        df["n_workers"] = max_workers
         results_rows.append(df)
         if nd is not None and not nd.empty:
             nd = nd.copy()
             nd["dataset_sizes"] = f"{N1}_vs_{N2}"
+            nd["dataset_pair_set"] = args.dataset_pair_set
+            nd["n_workers"] = max_workers
             null_rows.append(nd)
 
     results_df = pd.concat(results_rows, ignore_index=True)
@@ -141,10 +165,11 @@ def main() -> None:
             "effect": args.effect,
             "sampling": args.sampling,
             "null": args.null,
-            "executor": args.executor,
+            "n_workers": max_workers,
             "expand_union": args.expand_union,
             "progress": args.progress,
             "warn_eps": args.warn_eps,
+            "dataset_pair_set": args.dataset_pair_set,
         }, fh, indent=2)
     print(f"wrote {cfg_path}")
 
@@ -157,12 +182,18 @@ def main() -> None:
                 from scipy import stats as _sps
                 rows_obs = dfr.get("observed_clusters", dfr.get("total_clusters"))
                 dof = np.maximum(rows_obs.astype(float) - 1.0, 1.0)
-                dfr["chi_neg_log_p"] = -_sps.chi2.logsf(dfr["chi2"].to_numpy(dtype=float), dof.to_numpy(dtype=float)) / np.log(10.0)
+                vals = -_sps.chi2.logsf(dfr["chi2"].to_numpy(dtype=float), dof.to_numpy(dtype=float)) / np.log(10.0)
+                vals[~np.isfinite(vals)] = np.finfo(float).max
+                dfr["chi_neg_log_p"] = vals
             except Exception:
                 if "chi2_p" in dfr.columns:
-                    dfr["chi_neg_log_p"] = -np.log10(dfr["chi2_p"])  # no clipping fallback
+                    vals = -np.log10(dfr["chi2_p"].to_numpy(dtype=float))
+                    vals[~np.isfinite(vals)] = np.finfo(float).max
+                    dfr["chi_neg_log_p"] = vals  # clamped fallback
         elif "chi2_p" in dfr.columns and "chi_neg_log_p" not in dfr.columns:
-            dfr["chi_neg_log_p"] = -np.log10(dfr["chi2_p"])  # no clipping fallback
+            vals = -np.log10(dfr["chi2_p"].to_numpy(dtype=float))
+            vals[~np.isfinite(vals)] = np.finfo(float).max
+            dfr["chi_neg_log_p"] = vals  # clamped fallback
         dfr["total_cells"] = dfr["N1"] + dfr["N2"]
         dfr["total_number_of_clusters"] = dfr.get("observed_clusters", dfr.get("total_clusters", np.nan))
         dfr["batch_size_difference"] = (dfr["N1"] - dfr["N2"]).abs()

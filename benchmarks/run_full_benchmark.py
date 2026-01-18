@@ -4,12 +4,11 @@
 This orchestrates:
 - run_characterize_pmd.py (produces results.csv/null.csv/config.json)
 - plot_characterize_pmd.py (produces characterize_pmd.png and comparators figure)
-- fit_lambda_model.py (produces lambda_model.csv)
 
 Example:
   python benchmarks/run_full_benchmark.py \
     --K 10 --N1 2000 --N2 2000 --smax 10 --iters 5 --num-boot 200 \
-    --executor sequential --store-null true --expand-union true --progress true \
+    --max-workers 1 --store-null true --expand-union true --progress true \
     --tag rstyle --pdf true
 """
 
@@ -43,7 +42,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--effect-fold", type=float, default=3.0)
     ap.add_argument("--sampling", choices=["multinomial", "poisson_multinomial", "poisson_independent"], default="multinomial")
     ap.add_argument("--null", choices=["permutation", "parametric"], default="permutation")
-    ap.add_argument("--executor", choices=["sequential", "multiprocessing"], default="sequential")
+    ap.add_argument("--max-workers", type=int, default=None, help="number of worker processes (default: sequential)")
+    ap.add_argument("--executor", choices=["sequential", "multiprocessing"], default=None, help=argparse.SUPPRESS)
     ap.add_argument("--store-null", type=str, default="true")
     ap.add_argument("--expand-union", type=str, default="true")
     ap.add_argument("--progress", type=str, default="true")
@@ -56,6 +56,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    from benchmarks.config import resolve_max_workers, parallel_env
+    import warnings
+
+    max_workers = resolve_max_workers(args.max_workers)
+    if args.executor:
+        warnings.warn("--executor is deprecated; use --max-workers instead", DeprecationWarning)
+    os.environ.update(parallel_env())
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     def script_path(rel: str) -> str:
@@ -85,7 +92,7 @@ def main() -> None:
         "--effect-fold", str(args.effect_fold),
         "--sampling", args.sampling,
         "--null", args.null,
-        "--executor", args.executor,
+        "--max-workers", str(max_workers),
         "--store-null", args.store_null,
         "--expand-union", args.expand_union,
         "--progress", args.progress,
@@ -108,15 +115,7 @@ def main() -> None:
         plot_cmd += ["--pdf", os.path.join(run_dir, "characterize_pmd.pdf")]
     subprocess.run(plot_cmd, check=True)
 
-    # 4) Fit lambda smoother
-    fit_cmd: List[str] = [
-        sys.executable,
-        script_path("benchmarks/fit_lambda_model.py"),
-        "--dir", run_dir,
-    ]
-    subprocess.run(fit_cmd, check=True)
-
-    # 5) Print summary of outputs
+    # 4) Print summary of outputs
     print("\nBenchmark complete. Outputs in:")
     print(f"  {run_dir}")
     print(f"  - results.csv")
@@ -126,7 +125,6 @@ def main() -> None:
     print(f"  - characterize_comparators.png")
     if pdf_flag:
         print(f"  - characterize_pmd.pdf")
-    print(f"  - lambda_model.csv")
 
 
 if __name__ == "__main__":
